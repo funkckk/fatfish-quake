@@ -1,0 +1,247 @@
+name: CI Build Check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# One in-flight run per ref; a new push cancels the previous run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The commit gate, and the two structural gates that go with it. All of them
+  # run before the build matrix: a commit message cannot be repaired after a
+  # push without a force-push, so failing fast is what keeps that repair small.
+  # See commit.md.
+  gates:
+    runs-on: ubuntu-latest
+    # Naming any permission sets every one not listed to none.
+    permissions:
+      contents: read
+    outputs:
+      snapshot: ${{ steps.snapshot.outputs.publishes }}
+    steps:
+      # Full history: these gates walk the range this push or pull request
+      # adds, and a shallow clone has no base to compare against.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Commit message gate
+        # Through the environment, never interpolated into the script. GitHub
+        # substitutes `${{ }}` textually before bash sees the line, and on a
+        # fork's pull request the base ref is a branch name whoever opened it
+        # chose — so an inline expansion is a shell injection with extra steps.
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [ "$EVENT" = pull_request ]; then
+            # The branch's own tip, not the checked-out merge commit: a pull
+            # request builds a synthetic merge of the branch into the base, and
+            # every commit this gate judges has to be one somebody wrote.
+            git fetch --quiet origin "$BASE_REF"
+            range="$(git rev-parse "origin/$BASE_REF")..$HEAD_SHA"
+          else
+            # A push names what it replaced. On the first push to a new branch
+            # that is all zeroes, so fall back to the last commit alone.
+            case "$BEFORE" in
+            '' | 0000000000000000000000000000000000000000) range="HEAD~1..HEAD" ;;
+            *) range="$BEFORE..HEAD" ;;
+            esac
+          fi
+          echo "checking $range"
+          bash tool/check/commits.sh "$range"
+
+      # Rebased, not merged, and not behind.
+      #
+      # Neither reason is taste. A merge commit is invisible to the gate above
+      # — it walks with `--no-merges`, because a merge message is generated
+      # rather than written — so anything arriving through one is never judged.
+      # And a branch that is behind was tested against a main that no longer
+      # exists: the gates that passed describe a tree nobody will ever have.
+      - name: Branch is rebased on the base
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git fetch --quiet origin "$BASE_REF"
+          base="$(git rev-parse "origin/$BASE_REF")"
+
+          if merges="$(git rev-list --merges "$base..$HEAD_SHA")" && [ -n "$merges" ]; then
+            echo "::error::this branch merges $BASE_REF instead of rebasing onto it"
+            git --no-pager log --format='  %h %s' --merges "$base..$HEAD_SHA"
+            printf '\n  git rebase origin/%s\n  git push --force-with-lease\n' "$BASE_REF"
+            exit 1
+          fi
+
+          if ! git merge-base --is-ancestor "$base" "$HEAD_SHA"; then
+            echo "::error::this branch is behind $BASE_REF; rebase before merging"
+            printf '  %s is %s commit(s) ahead of this branch\n' \
+              "$BASE_REF" "$(git rev-list --count "$HEAD_SHA..$base")"
+            printf '\n  git fetch origin\n  git rebase origin/%s\n  git push --force-with-lease\n' "$BASE_REF"
+            exit 1
+          fi
+
+          echo "branch gate: rebased on $BASE_REF, no merge commits"
+
+      # The workflows themselves, because a broken one does not fail — it is
+      # *refused*. GitHub interpolates a `run` block whole before bash sees it,
+      # so an expression error anywhere in it, comment included, kills the run
+      # before a job exists: no failing step, and a file path where the job
+      # name should be. Nothing else here could catch that.
+      - name: Workflow gate
+        run: |
+          bash <(curl -sSf https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash) >/dev/null
+          ./actionlint -shellcheck= .github/workflows/*.yml
+
+      # Whether release.yml compiles this push, for `build` below. It publishes
+      # a snapshot only when a commit since the last tag carries a changelog
+      # entry; asked here of the push's own commits, which are always within
+      # that range. So "yes" here is always "yes" there, and a push this
+      # answers "no" for is compiled by `build` — at worst by both, never by
+      # neither.
+      - name: Does release.yml build this push
+        id: snapshot
+        if: github.event_name == 'push'
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if bash tool/release/notes.sh --any "$BEFORE..$GITHUB_SHA"; then
+            echo "publishes=true" >>"$GITHUB_OUTPUT"
+            echo "this push brings a changelog entry: release.yml builds it"
+          else
+            echo "publishes=false" >>"$GITHUB_OUTPUT"
+            echo "no changelog entry in this push: no snapshot, so it is built here"
+          fi
+
+  # Fast, platform-independent checks — run once before spending the build matrix.
+  check:
+    # Behind the gates: a rejected commit message or an unrebased branch is
+    # going to be force-pushed anyway, so compiling seven desktop targets first
+    # spends runner time on a tree that is about to be rewritten.
+    needs: gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Cache Bun dependencies
+        uses: actions/cache@v5
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Typecheck (core)
+        run: bun run --filter @trem/core typecheck
+
+      # The .bin files are generated from the .json beside them, and both the
+      # app and the Rust side read only the .bin. Edit a .json without
+      # re-encoding and the change never reaches anyone — which is how a
+      # region-code fix shipped in two snapshots without taking effect.
+      - name: Encoded data is up to date
+        run: |
+          bun scripts/encode-data.mjs
+          git diff --exit-code -- 'packages/core/src/data/*.bin' || {
+            echo "::error::a .bin is stale — run: bun scripts/encode-data.mjs, and commit the result"
+            exit 1
+          }
+
+      - name: Build web shell
+        run: bun run --filter @trem/web build
+
+  # Compile the desktop app on every target/arch we ship (see release.yml).
+  # --no-bundle: no installer/updater bundling, so no signing key is needed
+  # (works on fork PRs) and it's fast. Public repo → GitHub-hosted runners
+  # (incl. Linux/Windows arm64) are free with unlimited minutes.
+  #
+  # Every pull request, and only the pushes to main that publish no snapshot.
+  # A push that does starts release.yml, which compiles the same seven targets
+  # — bundled and signed — and fails that push just as this would; running both
+  # spent seven more runners, two of them macOS, on a build nobody installs.
+  # The gates and `check` above still run on every push.
+  build:
+    if: github.event_name == 'pull_request' || needs.gates.outputs.snapshot != 'true'
+    needs: [gates, check]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            target: aarch64-apple-darwin
+            args: "--target aarch64-apple-darwin"
+          - platform: macos-latest
+            target: x86_64-apple-darwin
+            args: "--target x86_64-apple-darwin"
+          - platform: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            args: ""
+          - platform: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            args: ""
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+            args: "--target x86_64-pc-windows-msvc"
+          - platform: windows-latest
+            target: aarch64-pc-windows-msvc
+            args: "--target aarch64-pc-windows-msvc"
+          - platform: windows-latest
+            target: i686-pc-windows-msvc
+            args: "--target i686-pc-windows-msvc"
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v5
+
+      # The ayatana indicator, as release.yml installs: see there for why.
+      - name: Install Linux dependencies
+        if: startsWith(matrix.platform, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libasound2-dev
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./apps/desktop/src-tauri -> target"
+          key: ${{ matrix.target }}
+
+      - name: Cache Bun dependencies
+        uses: actions/cache@v5
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Build desktop (compile check)
+        working-directory: apps/desktop
+        run: bun run tauri build --no-bundle ${{ matrix.args }}

@@ -1,0 +1,54 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "肥鱼quake",
+  "version": "26.1.0-26w39a",
+  "identifier": "com.fatfish.quake",
+  "build": {
+    "beforeDevCommand": "bun run --filter @trem/core dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "bun run --filter @trem/core build",
+    "frontendDist": "../../../packages/core/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "肥鱼quake",
+        "width": 1280,
+        "height": 815,
+        "minWidth": 900,
+        "minHeight": 680,
+        "visible": false,
+        "resizable": true,
+        "fullscreen": false,
+        "maximizable": true,
+        "backgroundThrottling": "disabled"
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "createUpdaterArtifacts": true,
+    "targets": [
+      "nsis",
+      "app",
+      "dmg",
+      "deb"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": [],
+    "category": "Utility",
+    "shortDescription": "全球多源地震监测与预警",
+    "longDescription": "肥鱼quake 聚合公开地震信息源，在实时地图上显示全球地震、多源预警与震度分布。"
+  },
+  "plugins": {}
+}

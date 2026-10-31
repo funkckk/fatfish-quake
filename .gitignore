@@ -1,0 +1,35 @@
+# Dependencies
+node_modules/
+.pnp.*
+
+# Build output (any workspace: packages/*/dist, apps/*/dist, Rust target/)
+dist/
+dist-ssr/
+target/
+.vite/
+*.tsbuildinfo
+*.local
+
+# Tauri
+**/src-tauri/gen/
+**/src-tauri/icons/_base1024.png
+
+# Logs
+logs
+*.log
+*-debug.log*
+
+# Editor / OS
+.DS_Store
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.sw?
+
+# Env
+.env
+.env.*
+!.env.example
+
+# Misc
+.eslintcache
